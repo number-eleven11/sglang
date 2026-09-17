@@ -19,6 +19,52 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _validate_deepseek_v41_contiguous_pp(cfg, hf_config) -> None:
+    """Validate the first supported V4.1 pipeline layout.
+
+    The 20/20 boundary is also a compressed-KV and candidate-source boundary,
+    so no attention-side cache state has to cross pipeline stages.
+    """
+    from sglang.srt.distributed.utils import get_pp_indices
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    stage_boundary = get_pp_indices(hf_config.num_hidden_layers, 1, cfg.pp_size)[0]
+    incompatible = (
+        ("PP sizes other than 2", cfg.pp_size != 2),
+        (
+            "a layer partition other than 20/20",
+            hf_config.num_hidden_layers != 40 or stage_boundary != 20,
+        ),
+        (
+            "multimodal serving",
+            hf_config.vision_n_layers > 0 and not cfg.language_model_only,
+        ),
+        (
+            "decode CUDA graphs",
+            cfg.cuda_graph_config.decode.backend != Backend.DISABLED,
+        ),
+        (
+            "prefill CUDA graphs",
+            cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+        ),
+        ("speculative decoding", cfg.speculative_algorithm is not None),
+        (
+            "context parallelism",
+            cfg.attn_cp_size > 1 or cfg.dcp_size > 1 or cfg.enable_prefill_cp,
+        ),
+        ("PD disaggregation", cfg.disaggregation_mode != "null"),
+    )
+    for feature, enabled in incompatible:
+        if enabled:
+            raise ValueError(
+                "DeepSeek-V4.1 contiguous PP2 does not support "
+                f"{feature} yet. Use a 20/20 layer split with CUDA graphs, "
+                "speculative decoding, context parallelism and PD "
+                "disaggregation disabled; for multimodal checkpoints, pass "
+                "--language-model-only."
+            )
+
+
 def validate_deepseek_v4_mega_moe_token_budget(
     server_args: ServerArgs,
 ) -> None:
@@ -274,6 +320,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             ("mixed prefill/decode", cfg.enable_mixed_chunk),
             ("LoRA", cfg.enable_lora),
             ("radix sessions", cfg.enable_session_radix_cache),
+            ("pipeline parallelism", cfg.pp_size > 1),
         )
         for feature, enabled in incompatible:
             if enabled:
@@ -302,7 +349,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         # and the encoder replay request window have no uniform-FP8 pool.
         ("the trtllm DSv4 attention backend", cfg.dsv4_attn_backend == "trtllm"),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
-        ("pipeline parallelism", cfg.pp_size > 1),
     )
     for feature, enabled in unsupported:
         if enabled:
@@ -310,6 +356,10 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 f"DeepSeek-V4.1 does not support {feature} yet; disable it to "
                 "serve this model."
             )
+
+    if cfg.pp_size > 1:
+        hf_config = model_config_of(server_args).hf_config
+        _validate_deepseek_v41_contiguous_pp(cfg, hf_config)
 
     if cfg.disaggregation_mode != "null" and cfg.speculative_algorithm is not None:
         from sglang.srt.speculative.ragged_verify import (
@@ -320,15 +370,13 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or cfg.dp_size != 1
-            or cfg.enable_dp_attention
             or cfg.attn_cp_size != 1
             or cfg.dcp_size != 1
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "and CP=1. Both servers must enable DSpark with the same "
+                "block size and target/draft KV layout."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
@@ -359,9 +407,6 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 "the prefill CUDA graph",
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
-            # input_ids_global is a DP-wide gather, not a per-local-token tensor,
-            # so the tail slice does not apply to it.
-            ("DP attention", cfg.enable_dp_attention),
         )
         for feature, enabled in incompatible:
             if enabled:
